@@ -1,8 +1,17 @@
+require 'active_support'
+require 'active_support/callbacks'
+
 module Delayed
   module Backend
     module Base
       def self.included(base)
         base.extend ClassMethods
+        base.class_eval do
+          include ::ActiveSupport::Callbacks
+
+          define_callbacks :work,               :rescuable => true
+          define_callbacks :payload_retrieval,  :rescuable => true
+        end
       end
 
       module ClassMethods
@@ -54,6 +63,15 @@ module Delayed
         def after_fork
         end
 
+        # convenience methods {before,after,around}_{payload_retrieval,work}
+        %w(before after around).each do |position|
+          %w(work payload_retrieval).each do  |hook|
+            define_method( "#{position}_#{hook}" ) do |*args, &block|
+              set_callback hook.to_sym, position.to_sym, *args, &block
+            end
+          end
+        end
+
         def work_off(num = 100)
           warn "[DEPRECATION] `Delayed::Job.work_off` is deprecated. Use `Delayed::Worker.new.work_off instead."
           Delayed::Worker.new.work_off(num)
@@ -81,7 +99,10 @@ module Delayed
       end
 
       def payload_object
-        @payload_object ||= YAML.load(self.handler)
+        @payload_object ||=
+          run_callbacks( :payload_retrieval ) do
+            YAML.load(self.handler)
+          end
       rescue TypeError, LoadError, NameError, ArgumentError => e
         raise DeserializationError,
           "Job failed to load: #{e.message}. Handler: #{handler.inspect}"
@@ -91,7 +112,7 @@ module Delayed
         Delayed::Worker.lifecycle.run_callbacks(:invoke_job, self) do
           begin
             hook :before
-            payload_object.perform
+            run_callbacks( :work ) { payload_object.perform }
             hook :success
           rescue Exception => e
             hook :error, e
